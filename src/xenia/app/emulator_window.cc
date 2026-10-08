@@ -9,6 +9,9 @@
 
 #include "xenia/app/emulator_window.h"
 
+#include <chrono>
+#include <thread>
+
 #include "third_party/imgui/imgui.h"
 #include "third_party/stb/stb_image_write.h"
 #include "third_party/tomlplusplus/toml.hpp"
@@ -56,6 +59,11 @@ DECLARE_bool(readback_memexport);
 
 DEFINE_bool(fullscreen, false, "Whether to launch the emulator in fullscreen.",
             "Display");
+
+DEFINE_int32(auto_screenshot_seconds, 0,
+             "If >0, automatically save a PNG screenshot of the guest output "
+             "every N seconds. For headless rendering verification.",
+             "Display");
 
 DEFINE_bool(controller_hotkeys, false, "Hotkeys for Xbox and PS controllers.",
             "General");
@@ -889,6 +897,21 @@ bool EmulatorWindow::Initialize() {
   }
 
   Profiler::SetUserIO(kZOrderProfiler, window_.get(), nullptr, nullptr);
+
+  if (cvars::auto_screenshot_seconds > 0) {
+    int interval = cvars::auto_screenshot_seconds;
+    std::thread([this, interval]() {
+      while (true) {
+        std::this_thread::sleep_for(std::chrono::seconds(interval));
+        app_context_.CallInUIThread([this]() {
+          if (emulator() && emulator()->title_id()) {
+            TakeScreenshot();
+          }
+        });
+      }
+    }).detach();
+    XELOGI("auto_screenshot: enabled, every {}s", interval);
+  }
 
   return true;
 }
