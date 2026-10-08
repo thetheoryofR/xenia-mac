@@ -29,8 +29,10 @@
 #include "xenia/base/mapped_memory.h"
 #include "xenia/base/platform.h"
 #include "xenia/base/string.h"
+#include "xenia/base/string_buffer.h"
 #include "xenia/base/system.h"
 #include "xenia/cpu/backend/a64/a64_backend.h"
+#include "xenia/cpu/ppc/ppc_opcode_info.h"
 #include "xenia/cpu/backend/code_cache.h"
 #include "xenia/cpu/backend/null_backend.h"
 #include "xenia/cpu/cpu_flags.h"
@@ -1071,6 +1073,8 @@ void Emulator::Pause() {
   if (paused_) {
     return;
   }
+  // [mac-port diag] who is pausing the emulator (suspends the GPU CP)?
+  XELOGE("[diag] Emulator::Pause() called");
   paused_ = true;
 
   // Don't hold the lock on this (so any waits follow through)
@@ -1256,6 +1260,35 @@ bool Emulator::ExceptionCallbackThunk(Exception* ex, void* data) {
 }
 
 bool Emulator::ExceptionCallback(Exception* ex) {
+  // [mac-port diag] surface every guest-code exception.
+  {
+    auto cc = processor()->backend()->code_cache();
+    auto gf = cc ? cc->LookupFunction(ex->pc()) : nullptr;
+    uint32_t guest_pc =
+        gf ? gf->MapMachineCodeToGuestAddress(ex->pc()) : 0xFFFFFFFFu;
+    std::string disasm = "?";
+    if (guest_pc != 0xFFFFFFFFu) {
+      uint32_t code =
+          xe::load_and_swap<uint32_t>(memory()->TranslateVirtual(guest_pc));
+      StringBuffer sb;
+      if (cpu::ppc::DisasmPPC(guest_pc, code, &sb)) {
+        disasm = sb.to_string();
+      }
+    }
+    XELOGE(
+        "[diag] ExceptionCallback code={} host_pc={:016X} guest_pc={:08X} "
+        "fault_addr={:016X} op={} insn=[{}]",
+        static_cast<int>(ex->code()), ex->pc(), guest_pc, ex->fault_address(),
+        static_cast<int>(ex->access_violation_operation()), disasm);
+    if (kernel::XThread::IsInThread()) {
+      auto* ctx = kernel::XThread::GetCurrentThread()->thread_state()->context();
+      XELOGE(
+          "[diag]   r3={:016X} r4={:016X} r5={:016X} r6={:016X} "
+          "virtual_membase={}",
+          ctx->r[3], ctx->r[4], ctx->r[5], ctx->r[6],
+          fmt::ptr(ctx->virtual_membase));
+    }
+  }
   // Check to see if the exception occurred in guest code.
   auto code_cache = processor()->backend()->code_cache();
   auto code_base = code_cache->execute_base_address();
