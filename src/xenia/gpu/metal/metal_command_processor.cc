@@ -2287,7 +2287,18 @@ bool MetalCommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type,
     used_texture_mask |= pixel_shader->GetUsedTextureMaskAfterTranslation();
   }
   if (texture_cache_ && used_texture_mask) {
+    in_draw_texture_request_ = true;
     texture_cache_->RequestTextures(used_texture_mask);
+    in_draw_texture_request_ = false;
+    if (!current_command_buffer_) {
+      // A texture upload submitted the draws recorded so far (see
+      // SubmitBeforeTextureUpload); continue in a new command buffer.
+      BeginCommandBuffer();
+      EnsureDrawRingCapacity();
+      if (!current_render_encoder_) {
+        return Fail("no render encoder available after texture upload");
+      }
+    }
   }
 
   struct VertexBindingRange {
@@ -3679,6 +3690,20 @@ void MetalCommandProcessor::EnsureDrawRingCapacity() {
   SetActiveDrawRing(ring);
   command_buffer_draw_rings_.push_back(ring);
   current_draw_index_ = 0;
+}
+
+void MetalCommandProcessor::SubmitBeforeTextureUpload() {
+  if (!in_draw_texture_request_ || !current_command_buffer_) {
+    return;
+  }
+  EndRenderEncoder();
+  ScheduleDrawRingRelease(current_command_buffer_);
+  current_command_buffer_->commit();
+  current_command_buffer_->release();
+  current_command_buffer_ = nullptr;
+  SetActiveDrawRing(nullptr);
+  current_draw_index_ = 0;
+  // The autorelease pool is kept and reused by the next BeginCommandBuffer.
 }
 
 void MetalCommandProcessor::EndCommandBuffer() {
