@@ -25,6 +25,7 @@
 #include "xenia/cpu/ppc/ppc_context.h"
 #include "xenia/cpu/ppc/ppc_decode_data.h"
 #include "xenia/cpu/ppc/ppc_frontend.h"
+#include "xenia/cpu/ppc/ppc_gears3_trace.h"
 #include "xenia/cpu/ppc/ppc_opcode_info.h"
 #include "xenia/cpu/processor.h"
 #include "xenia/cpu/xex_module.h"
@@ -116,6 +117,13 @@ bool PPCHIRBuilder::Emit(GuestFunction* function, uint32_t flags) {
 
   // Always mark entry with label.
   label_list_[0] = NewLabel();
+
+  // Gears 3 diagnostics (--gears3_trace): call a builtin before the body, so
+  // the entry label (and any branch back to it) stays after the hook.
+  if (auto* hook = gears3::EntryHookFor(frontend_->processor(), memory,
+                                        start_address_)) {
+    CallExtern(hook);
+  }
 
   uint32_t start_address = function_->address();
   uint32_t end_address = function_->end_address();
