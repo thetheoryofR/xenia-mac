@@ -15,6 +15,7 @@
 #include <algorithm>
 #include <cfloat>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <limits>
@@ -22,6 +23,7 @@
 #include <unordered_set>
 #include <vector>
 
+#include "third_party/half/include/half.hpp"
 #include "third_party/stb/stb_image_write.h"
 #include "xenia/base/assert.h"
 #include "xenia/base/autorelease_pool.h"
@@ -1169,6 +1171,99 @@ bool MetalTextureCache::TryGpuLoadTexture(Texture& texture, bool load_base,
               MTL::Region::Make2D(0, 0, upload_width, upload_height);
           mtl_texture->replaceRegion(region, level, slice, source_ptr,
                                      stored_layout->row_pitch_bytes, 0);
+        }
+      }
+    }
+  }
+
+  if (cvars::metal_texture_dump_png) {
+    // Diagnostic: log the key of each GPU texture load and write the untiled
+    // base level (as produced by the load shader) to a PNG, alongside a naive
+    // linear view of the guest bytes, so untiling / format bugs can be seen.
+    static uint32_t dump_count = 0;
+    static const uint32_t dump_from = [] {
+      const char* v = std::getenv("XE_TEXDUMP_FROM");
+      return v ? uint32_t(std::strtoul(v, nullptr, 10)) : 0u;
+    }();
+    uint32_t n = dump_count++;
+    if (n < dump_from + 4000) {
+      const StoredLevelHostLayout& base_layout = stored_levels.front();
+      uint32_t host_bpb = load_shader_info.bytes_per_host_block;
+      XELOGI(
+          "TEXDUMP#{} fmt={} {}x{}x{} dim={} tiled={} endian={} pitch32={} "
+          "base={:08X} mips={:08X} levels={}-{} packed={} shader={} "
+          "host_pitch={} host_bpb={} decompress={} scaled={}",
+          n, uint32_t(key.format), width, height, depth_or_array_size,
+          uint32_t(dimension), uint32_t(key.tiled), uint32_t(key.endianness),
+          uint32_t(key.pitch), base_guest_address, mips_guest_address,
+          level_first, level_last, level_packed, int(load_shader),
+          base_layout.row_pitch_bytes, host_bpb, decompress,
+          texture_resolution_scaled);
+      if (base_layout.is_base && !host_block_compressed && host_bpb == 8 &&
+          n >= dump_from && n < dump_from + 400) {
+        // 4x16-bit texels: half floats for the *_FLOAT formats, otherwise
+        // 16-bit fixed point. Write an 8-bit RGBA preview.
+        if (use_blit_upload) {
+          cmd->waitUntilCompleted();
+        }
+        std::filesystem::path dir = "/tmp/xenia_texdump";
+        std::filesystem::create_directories(dir);
+        const uint8_t* host =
+            static_cast<const uint8_t*>(dest_buffer->contents()) +
+            base_layout.dest_offset_bytes;
+        bool is_half = key.format == xenos::TextureFormat::k_16_16_16_16_FLOAT;
+        uint32_t w = base_layout.width_texels, h = base_layout.height_texels;
+        std::vector<uint8_t> rgba(size_t(w) * h * 4);
+        for (uint32_t y = 0; y < h; ++y) {
+          const uint16_t* row = reinterpret_cast<const uint16_t*>(
+              host + size_t(y) * base_layout.row_pitch_bytes);
+          for (uint32_t x = 0; x < w * 4; ++x) {
+            float f;
+            if (is_half) {
+              f = half_float::detail::half2float<float>(row[x]);
+            } else {
+              f = float(row[x]) / 65535.0f;
+            }
+            if (!(f > 0.0f)) f = 0.0f;
+            rgba[size_t(y) * w * 4 + x] = uint8_t(std::min(f, 1.0f) * 255.0f);
+          }
+        }
+        std::string name = fmt::format("{:04}_fmt{}_{}x{}_t{}_{:08X}", n,
+                                       uint32_t(key.format), width, height,
+                                       uint32_t(key.tiled), base_guest_address);
+        stbi_write_png((dir / (name + "_host.png")).string().c_str(), int(w),
+                       int(h), 4, rgba.data(), int(w * 4));
+      }
+      if (base_layout.is_base && !host_block_compressed &&
+          (host_bpb == 1 || host_bpb == 4) && n >= dump_from &&
+          n < dump_from + 400) {
+        if (use_blit_upload) {
+          cmd->waitUntilCompleted();
+        }
+        std::filesystem::path dir = "/tmp/xenia_texdump";
+        std::filesystem::create_directories(dir);
+        const uint8_t* host =
+            static_cast<const uint8_t*>(dest_buffer->contents()) +
+            base_layout.dest_offset_bytes;
+        int comp = host_bpb == 1 ? 1 : 4;
+        std::string name = fmt::format("{:04}_fmt{}_{}x{}_t{}_{:08X}", n,
+                                       uint32_t(key.format), width, height,
+                                       uint32_t(key.tiled), base_guest_address);
+        stbi_write_png((dir / (name + "_host.png")).string().c_str(),
+                       int(base_layout.width_texels),
+                       int(base_layout.height_texels), comp, host,
+                       int(base_layout.row_pitch_bytes));
+        if (!texture_resolution_scaled) {
+          const uint8_t* guest =
+              static_cast<const uint8_t*>(shared_buffer->contents()) +
+              base_guest_address;
+          uint32_t guest_row_bytes = uint32_t(key.pitch) * 32 * host_bpb;
+          uint32_t guest_rows = xe::align(height, uint32_t(32));
+          if (guest_row_bytes) {
+            stbi_write_png((dir / (name + "_guestraw.png")).string().c_str(),
+                           int(guest_row_bytes / host_bpb), int(guest_rows),
+                           comp, guest, int(guest_row_bytes));
+          }
         }
       }
     }

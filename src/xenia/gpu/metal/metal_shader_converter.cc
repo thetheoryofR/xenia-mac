@@ -7,6 +7,7 @@
  ******************************************************************************
  */
 
+#include <cstdlib>
 #include "xenia/gpu/metal/metal_shader_converter.h"
 
 #include "metal_irconverter.h"
@@ -308,8 +309,13 @@ bool MetalShaderConverter::ConvertWithStageEx(
   // 3. Our Metal textures are created as MTLTextureType2DArray
   IRCompilerSetCompatibilityFlags(
       compiler,
-      static_cast<IRCompatibilityFlags>(IRCompatibilityFlagForceTextureArray |
-                                        IRCompatibilityFlagBoundsCheck));
+      static_cast<IRCompatibilityFlags>(
+          IRCompatibilityFlagForceTextureArray |
+          IRCompatibilityFlagBoundsCheck | [] {
+            // Debug: XE_MSC_EXTRA_FLAGS ORs extra IRCompatibilityFlags in.
+            const char* v = std::getenv("XE_MSC_EXTRA_FLAGS");
+            return v ? int(std::strtoul(v, nullptr, 0)) : 0;
+          }()));
 
   if (input_topology != IRInputTopologyUndefined) {
     IRCompilerSetInputTopology(compiler,

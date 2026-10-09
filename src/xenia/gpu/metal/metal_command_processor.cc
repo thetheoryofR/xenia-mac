@@ -12,6 +12,8 @@
 
 #include <dispatch/dispatch.h>
 #include <algorithm>
+#include <unordered_map>
+#include <mutex>
 #include <array>
 #include <atomic>
 #include <cctype>
@@ -117,7 +119,23 @@ namespace metal {
 
 namespace {
 
-bool IssueDrawFailAt(int line) { return false; }
+bool IssueDrawFailAt(int line) {
+  // Count silent draw drops per call site; log the first few of each and then
+  // every 1000th so a systematically failing path is visible.
+  static std::mutex mutex;
+  static std::unordered_map<int, uint64_t> counts;
+  uint64_t n;
+  {
+    std::lock_guard<std::mutex> lock(mutex);
+    n = ++counts[line];
+  }
+  if (n <= 3 || n % 1000 == 0) {
+    XELOGW("Metal IssueDraw dropped a draw at metal_command_processor.cc:{} "
+           "(x{})",
+           line, n);
+  }
+  return false;
+}
 
 void LogMetalErrorDetails(const char* label, NS::Error* error) {
   if (!error) {

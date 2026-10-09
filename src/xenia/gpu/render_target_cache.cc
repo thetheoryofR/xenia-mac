@@ -877,6 +877,35 @@ bool RenderTargetCache::Update(bool is_rasterization_done,
   // draw with whatever contents currently are in the render target in this
   // case).
 
+  // Debug (XE_RESOLVE_LOG): report MSAA bindings whose estimated EDRAM claim
+  // is large, with the inputs of the height estimate.
+  static const bool claim_log = std::getenv("XE_RESOLVE_LOG") != nullptr;
+  static uint32_t claim_logged = 0;
+  if (claim_log && msaa_samples != xenos::MsaaSamples::k1X &&
+      claim_logged < 400) {
+    for (uint32_t i = 0; i < edram_bases_sorted_count; ++i) {
+      uint32_t end = edram_bases_sorted[i].first + rt_lengths_tiles[i];
+      if (edram_bases_sorted[i].first < 720 && end > 720) {
+        ++claim_logged;
+        auto scissor_br = regs.Get<reg::PA_SC_WINDOW_SCISSOR_BR>();
+        auto screen_br = regs.Get<reg::PA_SC_SCREEN_SCISSOR_BR>();
+        XELOGI(
+            "RTCLAIM rt{} base{} len{} msaa{} pitch{} height_used{} "
+            "rt_height{} scissor_br_y{} screen_br_y{} clip_disable{} "
+            "vte_cntl=0x{:08X} vport_yscale={} vport_yoffset={}",
+            edram_bases_sorted[i].second, edram_bases_sorted[i].first,
+            rt_lengths_tiles[i], uint32_t(msaa_samples), pitch_tiles_at_32bpp,
+            height_used,
+            GetRenderTargetHeight(pitch_tiles_at_32bpp, msaa_samples),
+            uint32_t(scissor_br.br_y), uint32_t(screen_br.br_y),
+            uint32_t(regs.Get<reg::PA_CL_CLIP_CNTL>().clip_disable),
+            regs[XE_GPU_REG_PA_CL_VTE_CNTL],
+            regs.Get<float>(XE_GPU_REG_PA_CL_VPORT_YSCALE),
+            regs.Get<float>(XE_GPU_REG_PA_CL_VPORT_YOFFSET));
+      }
+    }
+  }
+
   for (uint32_t i = 0; i < edram_bases_sorted_count; ++i) {
     const std::pair<uint32_t, uint32_t>& rt_base_index = edram_bases_sorted[i];
     uint32_t rt_bit_index = rt_base_index.second;

@@ -11,6 +11,10 @@
 #include "xenia/gpu/gpu_flags.h"
 
 #include <algorithm>
+#include <cmath>
+#include "third_party/half/include/half.hpp"
+#include <chrono>
+#include <cstdlib>
 #include <array>
 #include <cmath>
 #include <cstring>
@@ -1067,7 +1071,8 @@ bool MetalRenderTargetCache::Initialize() {
                               size_t(xenos::kEdramTileHeightSamples) *
                               size_t(scale_x) * size_t(scale_y);
   const size_t edram_size_bytes = edram_dwords * sizeof(uint32_t);
-  const bool edram_cpu_visible = false;
+  // XE_RESOLVE_LOG (debug) needs to read EDRAM back on the CPU.
+  const bool edram_cpu_visible = std::getenv("XE_RESOLVE_LOG") != nullptr;
   const MTL::ResourceOptions edram_storage_mode =
       edram_cpu_visible ? MTL::ResourceStorageModeShared
                         : MTL::ResourceStorageModePrivate;
@@ -3907,10 +3912,24 @@ void MetalRenderTargetCache::StoreTiledData(MTL::CommandBuffer* command_buffer,
   param_buffer->release();
 }
 
+// Set by the XE_RESOLVE_LOG probe in Resolve while it is logging.
+static bool g_resolve_probe_active = false;
+// Debug readback shared by the Resolve and DumpRenderTargets probes.
+static MTL::Buffer* rt_probe_buffer = nullptr;
+static std::string rt_probe_desc;
+static size_t rt_probe_bytes = 0;
+
 void MetalRenderTargetCache::DumpRenderTargets(
     uint32_t dump_base, uint32_t dump_row_length_used, uint32_t dump_rows,
     uint32_t dump_pitch, MTL::CommandBuffer* command_buffer) {
-  XELOGGPU(
+  bool dump_log_now = g_resolve_probe_active;
+#define DUMPLOG(...)              \
+  do {                            \
+    if (dump_log_now) {           \
+      XELOGI(__VA_ARGS__);        \
+    }                             \
+  } while (0)
+  DUMPLOG(
       "MetalRenderTargetCache::DumpRenderTargets: base={} row_length_used={} "
       "rows={} pitch={}",
       dump_base, dump_row_length_used, dump_rows, dump_pitch);
@@ -3919,7 +3938,7 @@ void MetalRenderTargetCache::DumpRenderTargets(
   GetResolveCopyRectanglesToDump(dump_base, dump_row_length_used, dump_rows,
                                  dump_pitch, rectangles);
 
-  XELOGGPU("MetalRenderTargetCache::DumpRenderTargets: {} rectangles to dump",
+  DUMPLOG("MetalRenderTargetCache::DumpRenderTargets: {} rectangles to dump",
            rectangles.size());
 
   if (rectangles.empty()) {
@@ -4007,6 +4026,13 @@ void MetalRenderTargetCache::DumpRenderTargets(
     }
 
     uint32_t dump_format = GetMetalEdramDumpFormat(key);
+    static const bool dump_7e3_as_8888 =
+        std::getenv("XE_DUMP7E3_AS8888") != nullptr;
+    if (dump_7e3_as_8888 &&
+        dump_format ==
+            static_cast<uint32_t>(MetalEdramDumpFormat::kColorRGB10A2Float)) {
+      dump_format = static_cast<uint32_t>(MetalEdramDumpFormat::kColorRGBA8);
+    }
     uint32_t dump_flags = 0;
     MTL::Texture* stencil_tex = nullptr;
     if (key.is_depth) {
@@ -4079,7 +4105,7 @@ void MetalRenderTargetCache::DumpRenderTargets(
     }
 
     if (!dump_pipeline) {
-      XELOGGPU(
+      DUMPLOG(
           "MetalRenderTargetCache::DumpRenderTargets: no dump pipeline for "
           "key=0x{:08X} (is_depth={}, is_64bpp={}, msaa={})",
           key.key, key.is_depth ? 1 : 0, is_64bpp ? 1 : 0,
@@ -4090,12 +4116,35 @@ void MetalRenderTargetCache::DumpRenderTargets(
       continue;
     }
 
-    XELOGGPU(
+    DUMPLOG(
         "MetalRenderTargetCache::DumpRenderTargets: dump RT key=0x{:08X} "
         "(is_depth={}, is_64bpp={}, msaa={}) tex={}x{} pipeline={:p}",
         key.key, key.is_depth ? 1 : 0, is_64bpp ? 1 : 0,
         static_cast<uint32_t>(key.msaa_samples), tex->width(), tex->height(),
         static_cast<void*>(dump_pipeline));
+
+    if (dump_log_now && tex->pixelFormat() == MTL::PixelFormatRGBA16Float &&
+        tex->sampleCount() == 1 && rt_probe_desc.empty()) {
+      // Read back exactly what the dump is about to read (before the
+      // compute encoder, so end it, blit, and reopen).
+      encoder->endEncoding();
+      size_t w = tex->width(), hgt = tex->height(), bytes = w * hgt * 8;
+      if (!rt_probe_buffer || rt_probe_buffer->length() < bytes) {
+        if (rt_probe_buffer) rt_probe_buffer->release();
+        rt_probe_buffer =
+            device_->newBuffer(bytes, MTL::ResourceStorageModeShared);
+      }
+      auto* blit = cmd->blitCommandEncoder();
+      blit->copyFromTexture(tex, 0, 0, MTL::Origin::Make(0, 0, 0),
+                            MTL::Size::Make(w, hgt, 1), rt_probe_buffer, 0,
+                            w * 8, 0);
+      blit->endEncoding();
+      rt_probe_bytes = bytes;
+      rt_probe_desc = fmt::format("DUMPSRC key=0x{:08X} {}x{}", key.key, w, hgt);
+      encoder = cmd->computeCommandEncoder();
+      encoder->setBuffer(edram_buffer_, 0, 0);
+      encoder->useResource(edram_buffer_, MTL::ResourceUsageWrite);
+    }
 
     ResolveCopyDumpRectangle::Dispatch
         dispatches[ResolveCopyDumpRectangle::kMaxDispatches];
@@ -4144,6 +4193,12 @@ void MetalRenderTargetCache::DumpRenderTargets(
 
       MTL::Size threads_per_group = MTL::Size::Make(40, 16, 1);
       MTL::Size threadgroups = MTL::Size::Make(groups_x, groups_y, 1);
+      DUMPLOG(
+          "DumpRenderTargets: dispatch {}/{} first_tile={} groups={}x{} "
+          "rect rows {}..{} src_base={} src_pitch={} fmt={}",
+          i, dispatch_count, constants.dispatch_first_tile, groups_x, groups_y,
+          rect.row_first, rect.row_first + rect.rows, key.base_tiles,
+          key.GetPitchTiles(), dump_format);
       encoder->dispatchThreadgroups(threadgroups, threads_per_group);
     }
 
@@ -4163,6 +4218,7 @@ void MetalRenderTargetCache::DumpRenderTargets(
   }
   // cmd is autoreleased from commandBuffer() - do not release
 }
+#undef DUMPLOG
 
 MTL::Library* MetalRenderTargetCache::GetOrCreateEdramLoadLibrary(bool msaa) {
   MTL::Library*& library =
@@ -4508,6 +4564,158 @@ bool MetalRenderTargetCache::Resolve(Memory& memory, uint32_t& written_address,
   uint32_t resolve_width = coord.width_div_8 * 8;
   uint32_t resolve_height = resolve_info.height_div_8 * 8;
 
+  // Debug probe (XE_RESOLVE_LOG=<first index>): describe each resolve and,
+  // one resolve later (metal_sync_on_resolve has drained the GPU by then),
+  // report how much of the previous destination range and EDRAM span is
+  // non-zero.
+  static const int64_t resolve_log_from = [] {
+    const char* v = std::getenv("XE_RESOLVE_LOG");
+    return v ? int64_t(std::strtoll(v, nullptr, 10)) : int64_t(-1);
+  }();
+  static uint64_t resolve_index = 0;
+  static uint32_t prev_dest = 0, prev_len = 0, prev_edram_base = 0,
+                  prev_edram_len = 0;
+  static bool prev_valid = false;
+  // XE_RESOLVE_LOG is in seconds after the first resolve.
+  static const auto resolve_t0 = std::chrono::steady_clock::now();
+  static uint64_t resolve_logged = 0;
+  uint64_t this_resolve = resolve_index++;
+  bool resolve_log =
+      resolve_log_from >= 0 && resolve_logged < 600 &&
+      std::chrono::steady_clock::now() - resolve_t0 >=
+          std::chrono::seconds(resolve_log_from);
+  if (resolve_log) ++resolve_logged;
+  if (resolve_log) {
+    auto count_nonzero = [](const uint8_t* p, size_t n) {
+      size_t c = 0;
+      for (size_t i = 0; i < n; i += 4) {
+        c += (p[i] | p[i + 1] | p[i + 2] | p[i + 3]) != 0;
+      }
+      return c;
+    };
+    if (prev_valid) {
+      auto* shared = command_processor_.shared_memory();
+      const uint8_t* mem =
+          shared && shared->GetBuffer()
+              ? static_cast<const uint8_t*>(shared->GetBuffer()->contents())
+              : nullptr;
+      const uint8_t* edram =
+          edram_buffer_ ? static_cast<const uint8_t*>(edram_buffer_->contents())
+                        : nullptr;
+      size_t dest_nz = mem ? count_nonzero(mem + prev_dest, prev_len) : 0;
+      size_t edram_nz =
+          edram && prev_edram_len
+              ? count_nonzero(edram + size_t(prev_edram_base) * 4,
+                              prev_edram_len)
+              : 0;
+      XELOGI("RESOLVE#{} result: dest nonzero dwords {}/{} edram nonzero {}/{}",
+             this_resolve - 1, dest_nz, prev_len / 4, edram_nz,
+             prev_edram_len / 4);
+    }
+    RenderTargetKey sk_value;
+    if (src_rt) sk_value = src_rt->key();
+    const RenderTargetKey* sk = src_rt ? &sk_value : nullptr;
+    XELOGI(
+        "RESOLVE#{} depth={} src_rt={} src_fmt={} src_base={} msaa={} "
+        "{}x{} dest=0x{:08X} len={} dest_fmt={} dest_endian={} "
+        "copy_cmd={} color_clear={} depth_clear={} sample_select={}",
+        this_resolve, is_depth, src_rt != nullptr,
+        sk ? uint32_t(sk->resource_format) : 0xFFFFFFFFu,
+        sk ? uint32_t(sk->base_tiles) : 0xFFFFFFFFu,
+        sk ? uint32_t(sk->msaa_samples) : 0xFFFFFFFFu, resolve_width,
+        resolve_height, resolve_info.copy_dest_extent_start,
+        resolve_info.copy_dest_extent_length,
+        uint32_t(resolve_info.copy_dest_info.copy_dest_format),
+        uint32_t(resolve_info.copy_dest_info.copy_dest_endian),
+        uint32_t(resolve_info.rb_copy_control.copy_command),
+        resolve_info.IsClearingColor(), resolve_info.IsClearingDepth(),
+        uint32_t(resolve_info.rb_copy_control.copy_sample_select));
+    const auto& ce = resolve_info.color_edram_info;
+    std::string bound;
+    if (accumulated_targets) {
+      for (uint32_t i = 0; i < 1 + xenos::kMaxColorRenderTargets; ++i) {
+        if (!accumulated_targets[i]) continue;
+        RenderTargetKey k = accumulated_targets[i]->key();
+        bound += fmt::format(" [{}:fmt{} base{} pitch{} msaa{}]", i,
+                             uint32_t(k.resource_format), uint32_t(k.base_tiles),
+                             k.GetPitchTiles(), uint32_t(k.msaa_samples));
+      }
+    }
+    // Read back any bound non-MSAA 64bpp-float colour target (the 7e3 scene
+    // target is stored as RGBA16F) through a blit in this command buffer;
+    // counted at the next resolve once metal_sync_on_resolve has drained it.
+    if (rt_probe_buffer && !rt_probe_desc.empty()) {
+      const uint16_t* h =
+          static_cast<const uint16_t*>(rt_probe_buffer->contents());
+      size_t nz = 0, n = rt_probe_bytes / 2;
+      float maxv = 0.0f;
+      double sum = 0.0;
+      size_t hist[8] = {};  // <1e-4, <1e-3, <1e-2, <0.1, <1, <4, <32, more
+      for (size_t k = 0; k < n; ++k) {
+        if ((k & 3) == 3) continue;  // skip alpha
+        nz += (h[k] & 0x7FFF) != 0;
+        float f = std::abs(half_float::detail::half2float<float>(h[k]));
+        if (!(f == f)) continue;
+        maxv = std::max(maxv, f);
+        sum += f;
+        int b = f < 1e-4f ? 0 : f < 1e-3f ? 1 : f < 1e-2f ? 2 : f < 0.1f ? 3
+              : f < 1.0f ? 4 : f < 4.0f ? 5 : f < 32.0f ? 6 : 7;
+        ++hist[b];
+      }
+      static int rt_probe_saved = 0;
+      if (rt_probe_saved < 3 &&
+          rt_probe_desc.find("DUMPSRC") != std::string::npos) {
+        std::string path =
+            fmt::format("/tmp/xenia_rtprobe_{}.bin", rt_probe_saved++);
+        if (FILE* f = std::fopen(path.c_str(), "wb")) {
+          std::fwrite(h, 1, rt_probe_bytes, f);
+          std::fclose(f);
+        }
+      }
+      XELOGI("RTPROBE {} nonzero rgb halfs {}/{} max {} mean {} hist "
+             "[<1e-4 {} <1e-3 {} <1e-2 {} <.1 {} <1 {} <4 {} <32 {} >= {}]",
+             rt_probe_desc, nz, n * 3 / 4, maxv, sum / double(n * 3 / 4),
+             hist[0], hist[1], hist[2], hist[3], hist[4], hist[5], hist[6],
+             hist[7]);
+      rt_probe_desc.clear();
+    }
+    if (accumulated_targets && command_buffer) {
+      for (uint32_t i = 1; i < 1 + xenos::kMaxColorRenderTargets; ++i) {
+        auto* mrt = static_cast<MetalRenderTarget*>(accumulated_targets[i]);
+        if (!mrt || !mrt->draw_texture()) continue;
+        MTL::Texture* t = mrt->draw_texture();
+        if (t->pixelFormat() != MTL::PixelFormatRGBA16Float ||
+            t->sampleCount() > 1) {
+          continue;
+        }
+        size_t w = t->width(), hgt = t->height();
+        size_t bytes = w * hgt * 8;
+        if (!rt_probe_buffer || rt_probe_buffer->length() < bytes) {
+          if (rt_probe_buffer) rt_probe_buffer->release();
+          rt_probe_buffer =
+              device_->newBuffer(bytes, MTL::ResourceStorageModeShared);
+        }
+        auto* blit = command_buffer->blitCommandEncoder();
+        blit->copyFromTexture(t, 0, 0, MTL::Origin::Make(0, 0, 0),
+                              MTL::Size::Make(w, hgt, 1), rt_probe_buffer, 0,
+                              w * 8, 0);
+        blit->endEncoding();
+        rt_probe_bytes = bytes;
+        RenderTargetKey k = mrt->key();
+        rt_probe_desc = fmt::format("resolve#{} slot{} fmt{} base{} {}x{}",
+                                    this_resolve, i, uint32_t(k.resource_format),
+                                    uint32_t(k.base_tiles), w, hgt);
+        break;
+      }
+    }
+    XELOGI("RESOLVE#{} want: copy_src={} color_fmt={} base={} pitch={} "
+           "msaa={} 64bpp={} | bound:{}",
+           this_resolve, uint32_t(resolve_info.rb_copy_control.copy_src_select),
+           uint32_t(ce.format), uint32_t(ce.base_tiles),
+           uint32_t(ce.pitch_tiles), uint32_t(ce.msaa_samples),
+           uint32_t(ce.format_is_64bpp), bound);
+  }
+
   // Section 6.2: Inspect source render target before DumpRenderTargets.
   // If this shows non-zero pixels but EDRAM is zero after DumpRenderTargets,
   // the bug is in the Metal dump shaders (bindings or address math).
@@ -4534,8 +4742,19 @@ bool MetalRenderTargetCache::Resolve(Memory& memory, uint32_t& written_address,
   // Match D3D12/Vulkan: dump host RT ownership into EDRAM, then resolve
   // from EDRAM to shared memory. Resolve-time blend fallback is not correct
   // because blending state is per-draw, not per-resolve.
+  g_resolve_probe_active = resolve_log;
   DumpRenderTargets(dump_base, dump_row_length_used, dump_rows, dump_pitch,
                     command_buffer);
+  g_resolve_probe_active = false;
+  if (resolve_log) {
+    prev_valid = true;
+    prev_dest = resolve_info.copy_dest_extent_start;
+    prev_len = resolve_info.copy_dest_extent_length;
+    prev_edram_base = dump_base * xenos::kEdramTileWidthSamples *
+                      xenos::kEdramTileHeightSamples;
+    prev_edram_len = dump_rows * dump_pitch * xenos::kEdramTileWidthSamples *
+                     xenos::kEdramTileHeightSamples * 4;
+  }
 
   uint32_t dest_base = resolve_info.copy_dest_base;
   uint32_t dest_local_start = resolve_info.copy_dest_extent_start - dest_base;

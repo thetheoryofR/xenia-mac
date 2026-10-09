@@ -33,6 +33,11 @@ DEFINE_bool(disable_context_promotion, false,
             "some sports games, but will reduce performance.",
             "CPU");
 
+DEFINE_bool(disable_constant_propagation, false,
+            "Disables the HIR constant propagation pass (debugging: isolates "
+            "backend bugs in constant-operand sequences).",
+            "CPU");
+
 namespace xe {
 namespace cpu {
 namespace ppc {
@@ -75,8 +80,10 @@ PPCTranslator::PPCTranslator(PPCFrontend* frontend) : frontend_(frontend) {
   auto sap = std::make_unique<passes::ConditionalGroupPass>();
   sap->AddPass(std::make_unique<passes::SimplificationPass>());
   if (validate) sap->AddPass(std::make_unique<passes::ValidationPass>());
-  sap->AddPass(std::make_unique<passes::ConstantPropagationPass>());
-  if (validate) sap->AddPass(std::make_unique<passes::ValidationPass>());
+  if (!cvars::disable_constant_propagation) {
+    sap->AddPass(std::make_unique<passes::ConstantPropagationPass>());
+    if (validate) sap->AddPass(std::make_unique<passes::ValidationPass>());
+  }
   compiler_->AddPass(std::move(sap));
 
   if (backend->machine_info()->supports_extended_load_store) {
