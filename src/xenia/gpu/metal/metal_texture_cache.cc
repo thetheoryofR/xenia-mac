@@ -13,6 +13,7 @@
 #include "xenia/gpu/metal/metal_resource_tracker.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cfloat>
 #include <cstdio>
 #include <cstdlib>
@@ -1069,8 +1070,10 @@ bool MetalTextureCache::TryGpuLoadTexture(Texture& texture, bool load_base,
     release_buffer_after(cmd, dest_buffer, size_t(dest_buffer_size));
     cmd->retain();
     cmd->addCompletedHandler([](MTL::CommandBuffer* cb) { cb->release(); });
+    command_processor_->SubmitBeforeTextureUpload();
     cmd->commit();
   } else {
+    command_processor_->SubmitBeforeTextureUpload();
     cmd->commit();
     cmd->waitUntilCompleted();
 
@@ -1181,10 +1184,26 @@ bool MetalTextureCache::TryGpuLoadTexture(Texture& texture, bool load_base,
     // base level (as produced by the load shader) to a PNG, alongside a naive
     // linear view of the guest bytes, so untiling / format bugs can be seen.
     static uint32_t dump_count = 0;
-    static const uint32_t dump_from = [] {
+    static uint32_t dump_from = [] {
       const char* v = std::getenv("XE_TEXDUMP_FROM");
       return v ? uint32_t(std::strtoul(v, nullptr, 10)) : 0u;
     }();
+    // XE_TEXDUMP_AFTER_SEC: start the dump window this many seconds after the
+    // first texture load (overrides XE_TEXDUMP_FROM once reached).
+    static const int64_t dump_after_sec = [] {
+      const char* v = std::getenv("XE_TEXDUMP_AFTER_SEC");
+      return v ? int64_t(std::strtoll(v, nullptr, 10)) : int64_t(-1);
+    }();
+    static const auto dump_t0 = std::chrono::steady_clock::now();
+    static bool dump_time_armed = false;
+    if (dump_after_sec >= 0 && !dump_time_armed) {
+      dump_from = 0xFFFFFFF0u;
+      if (std::chrono::steady_clock::now() - dump_t0 >=
+          std::chrono::seconds(dump_after_sec)) {
+        dump_time_armed = true;
+        dump_from = dump_count;
+      }
+    }
     uint32_t n = dump_count++;
     if (n < dump_from + 4000) {
       const StoredLevelHostLayout& base_layout = stored_levels.front();
@@ -1235,8 +1254,8 @@ bool MetalTextureCache::TryGpuLoadTexture(Texture& texture, bool load_base,
                        int(h), 4, rgba.data(), int(w * 4));
       }
       if (base_layout.is_base && !host_block_compressed &&
-          (host_bpb == 1 || host_bpb == 4) && n >= dump_from &&
-          n < dump_from + 400) {
+          (host_bpb == 1 || host_bpb == 2 || host_bpb == 4) &&
+          n >= dump_from && n < dump_from + 400) {
         if (use_blit_upload) {
           cmd->waitUntilCompleted();
         }
@@ -1249,11 +1268,45 @@ bool MetalTextureCache::TryGpuLoadTexture(Texture& texture, bool load_base,
         std::string name = fmt::format("{:04}_fmt{}_{}x{}_t{}_{:08X}", n,
                                        uint32_t(key.format), width, height,
                                        uint32_t(key.tiled), base_guest_address);
-        stbi_write_png((dir / (name + "_host.png")).string().c_str(),
-                       int(base_layout.width_texels),
-                       int(base_layout.height_texels), comp, host,
-                       int(base_layout.row_pitch_bytes));
-        if (!texture_resolution_scaled) {
+        if (host_bpb == 2) {
+          uint32_t w = base_layout.width_texels, h = base_layout.height_texels;
+          std::vector<uint8_t> rgb(size_t(w) * h * 3);
+          for (uint32_t y = 0; y < h; ++y) {
+            const uint8_t* row = host + size_t(y) * base_layout.row_pitch_bytes;
+            for (uint32_t x = 0; x < w; ++x) {
+              rgb[(size_t(y) * w + x) * 3 + 0] = row[x * 2];
+              rgb[(size_t(y) * w + x) * 3 + 1] = row[x * 2 + 1];
+              rgb[(size_t(y) * w + x) * 3 + 2] = 0;
+            }
+          }
+          stbi_write_png((dir / (name + "_host.png")).string().c_str(), int(w),
+                         int(h), 3, rgb.data(), int(w * 3));
+        } else {
+          stbi_write_png((dir / (name + "_host.png")).string().c_str(),
+                         int(base_layout.width_texels),
+                         int(base_layout.height_texels), comp, host,
+                         int(base_layout.row_pitch_bytes));
+        }
+        // Also write mip levels 1..3 as read back from the Metal texture.
+        if (host_bpb == 4 && mtl_texture->storageMode() != MTL::StorageModePrivate &&
+            !host_block_compressed) {
+          if (!use_blit_upload) {
+            // replaceRegion already done synchronously.
+          } else {
+            cmd->waitUntilCompleted();
+          }
+          uint32_t levels = std::min<uint32_t>(level_last, 3);
+          for (uint32_t lv = 1; lv <= levels; ++lv) {
+            uint32_t mw = std::max(width >> lv, 1u), mh = std::max(height >> lv, 1u);
+            std::vector<uint8_t> px(size_t(mw) * mh * 4);
+            mtl_texture->getBytes(px.data(), mw * 4, mw * mh * 4,
+                                  MTL::Region::Make2D(0, 0, mw, mh), lv, 0);
+            stbi_write_png(
+                (dir / fmt::format("{}_mip{}.png", name, lv)).string().c_str(),
+                int(mw), int(mh), 4, px.data(), int(mw * 4));
+          }
+        }
+        if (!texture_resolution_scaled && host_bpb != 2) {
           const uint8_t* guest =
               static_cast<const uint8_t*>(shared_buffer->contents()) +
               base_guest_address;
@@ -2636,6 +2689,13 @@ MTL::SamplerState* MetalTextureCache::GetOrCreateSampler(
       parameters.aniso_filter == xenos::AnisoFilter::kDisabled &&
       !parameters.mip_linear) {
     max_lod += 0.25f;
+  }
+  // Debug (XE_FORCE_LOD0): sample only the base level, to tell broken mip
+  // uploads apart from shading problems.
+  static const bool force_lod0 = std::getenv("XE_FORCE_LOD0") != nullptr;
+  if (force_lod0) {
+    desc->setLodMinClamp(0.0f);
+    max_lod = 0.0f;
   }
   desc->setLodMaxClamp(max_lod);
   desc->setLodAverage(false);
